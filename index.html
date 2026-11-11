@@ -520,6 +520,11 @@
       <label class="btn ghost small" style="cursor:pointer">Backup terugzetten<input type="file" id="backup-file" accept=".json,application/json" hidden></label>
       <span class="note" id="backup-status"></span>
     </div>
+    <div class="acties" style="margin-top:10px">
+      <span class="note">Automatische backups in je account (elke 7 dagen bij openen, laatste 8 bewaard):</span>
+      <select id="backup-kies" style="min-width:220px"></select>
+      <button class="btn ghost small" id="backup-herstel">Zet terug uit account</button>
+    </div>
   </section>
 </div>
 
@@ -1939,6 +1944,7 @@ async function loadArchive(){
     CONTACTS = docs.filter(d => String(d.id).startsWith('C-')).map(d => Object.assign({}, d.data(), {id: d.id}))
       .sort((a,b) => String(a.naam || a.bedrijf || '').localeCompare(String(b.naam || b.bedrijf || ''), 'nl'));
     renderArchive(); renderLopend(); renderContacts(); renderContactSelect();
+    await autoBackupCheck(docs);
     return true;
   }catch(e){
     toast('Archief laden lukt niet.'); return false;
@@ -3057,11 +3063,45 @@ async function laadInstellingen(){
     else { await saveCloud(); }
   }catch(e){ toast('Prijzen laden uit account lukt niet.'); }
 }
+// automatische backup in de account: id = BACKUP-JJJJ-MM-DD, wordt niet meegeteld als offerte of contact
+const BACKUP_PREFIX = 'BACKUP-';
+let BACKUPS = [];
+function backupData(){
+  return {versie: 1, datum: new Date().toISOString(), instellingen: instellingenData(),
+    contacten: CONTACTS.map(c => Object.assign({}, c)), archief: ARCH.map(r => Object.assign({}, r))};
+}
+function renderBackupKeuze(){
+  const sel = $('#backup-kies'); if(!sel) return;
+  sel.innerHTML = BACKUPS.length ? BACKUPS.map(id => `<option value="${esc(id)}">${esc(id.slice(BACKUP_PREFIX.length))}</option>`).join('') : '<option value="">geen backups in account</option>';
+}
+async function autoBackupCheck(docs){
+  try{
+    BACKUPS = docs.filter(d => String(d.id).startsWith(BACKUP_PREFIX)).map(d => String(d.id)).sort().reverse();
+    const laatste = BACKUPS[0] ? new Date(BACKUPS[0].slice(BACKUP_PREFIX.length) + 'T12:00:00') : null;
+    if(!laatste || Date.now() - laatste.getTime() > 7*24*3600*1000){
+      const json = JSON.stringify(backupData());
+      if(json.length > 900000){ toast('Automatische backup past niet in je account; maak handmatig een backup.'); return; }
+      const id = BACKUP_PREFIX + todayIso();
+      await COLL.doc(id).set({json, datum: new Date().toISOString()});
+      BACKUPS = [id, ...BACKUPS.filter(x => x !== id)];
+      for(const old of BACKUPS.slice(8)) await COLL.doc(old).delete();
+      BACKUPS = BACKUPS.slice(0, 8);
+    }
+    renderBackupKeuze();
+  }catch(e){ /* automatische backup mislukt: stil, de handmatige backup blijft werken */ }
+}
+$('#backup-herstel').addEventListener('click', async () => {
+  const id = $('#backup-kies').value; const st = $('#backup-status');
+  if(!id || !COLL){ st.textContent = 'Kies eerst een backup.'; return; }
+  st.textContent = 'Bezig met terugzetten…';
+  try{
+    const snap = await COLL.doc(id).get();
+    const data = JSON.parse(snap.data().json);
+    await zetTerug(data, st);
+  }catch(e){ st.textContent = 'Terugzetten lukt niet: ' + (e.message || e.code); }
+});
 async function backupMaken(){
-  const data = {
-    versie: 1, datum: new Date().toISOString(), instellingen: instellingenData(),
-    contacten: CONTACTS.map(c => Object.assign({}, c)), archief: ARCH.map(r => Object.assign({}, r))
-  };
+  const data = backupData();
   const bytes = new TextEncoder().encode(JSON.stringify(data, null, 2));
   await saveFile('backup_van-leeuwen_' + todayIso() + '.json', bytes);
 }
@@ -3069,6 +3109,16 @@ $('#backup-maak').addEventListener('click', async () => {
   if(!COLL && !DL){ toast('Backup maken is hier niet beschikbaar.'); return; }
   try{ await backupMaken(); }catch(e){ toast('Backup maken lukt niet: ' + e.message); }
 });
+// gedeeld: zet een backup terug (bestand of uit account)
+async function zetTerug(data, st){
+  if(!data || (!data.instellingen && !data.contacten && !data.archief)) throw new Error('dit is geen Van Leeuwen backup');
+  if(data.instellingen){ applyInstellingen(data.instellingen); await saveCloud(); }
+  let n = 0;
+  for(const c of (data.contacten || [])){ const {id, ...rest} = c; if(id){ await COLL.doc(id).set(rest); n++; } }
+  for(const r of (data.archief || [])){ const {nr, ...rest} = r; if(nr){ await COLL.doc(nr).set(rest); n++; } }
+  await loadArchive();
+  st.textContent = 'Backup teruggezet: ' + n + ' offertes en contacten.';
+}
 $('#backup-file').addEventListener('change', async e => {
   const f = e.target.files[0]; e.target.value = ''; if(!f) return;
   const st = $('#backup-status');
@@ -3076,13 +3126,7 @@ $('#backup-file').addEventListener('change', async e => {
   st.textContent = 'Bezig met terugzetten…';
   try{
     const data = JSON.parse(await f.text());
-    if(!data || (!data.instellingen && !data.contacten && !data.archief)) throw new Error('dit is geen Van Leeuwen backup');
-    if(data.instellingen){ applyInstellingen(data.instellingen); await saveCloud(); }
-    let n = 0;
-    for(const c of (data.contacten || [])){ const {id, ...rest} = c; if(id){ await COLL.doc(id).set(rest); n++; } }
-    for(const r of (data.archief || [])){ const {nr, ...rest} = r; if(nr){ await COLL.doc(nr).set(rest); n++; } }
-    await loadArchive();
-    st.textContent = 'Backup teruggezet: ' + n + ' offertes en contacten.';
+    await zetTerug(data, st);
   }catch(err){ st.textContent = 'Terugzetten lukt niet: ' + (err.message || err); }
 });
 
